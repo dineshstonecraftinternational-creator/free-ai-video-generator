@@ -11,7 +11,7 @@ on:
       script_path:
         description: "Path to an EXISTING .txt file already committed in this repo, e.g. scripts/example_script.txt (NOT the script text itself)"
         required: false
-        default: "scripts/example_script.txt"
+        default: "scripts/honey_badger_test.txt"
       voice:
         description: "Optional: override TTS voice (e.g. fa-IR-DilaraNeural, ja-JP-NanamiNeural)"
         required: false
