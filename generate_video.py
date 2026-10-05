@@ -2,9 +2,6 @@
 
 import argparse
 import asyncio
-import random
-import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,90 +11,71 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 DEFAULT_VOICE = "en-US-GuyNeural"
-CANVAS_W = 1920
-CANVAS_H = 1080
-FPS = 25
+WIDTH = 1920
+HEIGHT = 1080
+FPS = 30
 
 
-def run(cmd, **kwargs):
+def run(cmd):
+    print(">", " ".join(str(x) for x in cmd))
+    subprocess.run(cmd, check=True)
+
+
+def get_duration(audio_file):
     result = subprocess.run(
-        cmd,
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_file),
+        ],
         capture_output=True,
         text=True,
-        **kwargs
+        check=True,
     )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Command failed: {' '.join(str(x) for x in cmd)}\n"
-            f"{result.stderr[-4000:]}"
-        )
-
-    return result
-
-
-def get_duration(path):
-    result = run([
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ])
-
     return float(result.stdout.strip())
 
 
-def parse_script(path):
-    raw = Path(path).read_text(encoding="utf-8")
+def parse_script(script_path):
+    raw = Path(script_path).read_text(encoding="utf-8")
 
     blocks = raw.split("---")
 
-    settings = {
-        "voice": DEFAULT_VOICE,
-        "music": None,
-    }
+    voice = DEFAULT_VOICE
+    music = None
 
     header = blocks[0].strip()
 
     for line in header.splitlines():
         line = line.strip()
 
-        if not line:
-            continue
-
         if line.upper().startswith("VOICE:"):
-            settings["voice"] = line.split(":", 1)[1].strip()
+            voice = line.split(":", 1)[1].strip()
 
         elif line.upper().startswith("MUSIC:"):
             value = line.split(":", 1)[1].strip()
-            settings["music"] = value or None
+            music = value if value else None
 
     scenes = []
 
-    for index, block in enumerate(blocks[1:], start=1):
+    for block in blocks[1:]:
         block = block.strip()
 
         if not block:
             continue
 
-        lines = [
-            line.strip()
-            for line in block.splitlines()
-            if line.strip()
-        ]
-
         image_name = None
         narration_lines = []
 
-        for line in lines:
+        for line in block.splitlines():
+            line = line.strip()
 
-            if line.upper().startswith("IMAGE:") and image_name is None:
+            if not line:
+                continue
+
+            if line.upper().startswith("IMAGE:"):
                 image_name = line.split(":", 1)[1].strip()
-
             else:
                 narration_lines.append(line)
 
@@ -106,17 +84,17 @@ def parse_script(path):
         if not narration:
             continue
 
-        scenes.append({
-            "image": image_name,
-            "narration": narration,
-        })
-
-    if not scenes:
-        raise ValueError(
-            "No scenes found. Separate scenes with --- lines."
+        scenes.append(
+            {
+                "image": image_name,
+                "narration": narration,
+            }
         )
 
-    return settings, scenes
+    if not scenes:
+        raise ValueError("No scenes found in script.")
+
+    return voice, music, scenes
 
 
 async def synthesize_async(text, voice, output):
@@ -124,103 +102,73 @@ async def synthesize_async(text, voice, output):
 
     with open(output, "wb") as f:
         async for chunk in communicate.stream():
-
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
 
 
 def synthesize_narration(text, voice, output):
-    asyncio.run(
-        synthesize_async(text, voice, output)
-    )
+    asyncio.run(synthesize_async(text, voice, output))
 
 
-def find_image(image_name, index, image_dir):
-    extensions = [
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-    ]
+def find_image(image_name, image_folder, scene_number):
+    folder = Path(image_folder)
 
-    # If IMAGE: explicitly specifies a filename
+    candidates = []
+
     if image_name:
-        possible = Path(image_name)
+        candidates.append(folder / image_name)
 
-        candidates = [
-            image_dir / possible.name,
-            Path(image_name),
+    candidates.extend(
+        [
+            folder / f"{scene_number:03d}.jpg",
+            folder / f"{scene_number:03d}.jpeg",
+            folder / f"{scene_number:03d}.png",
+            folder / f"{scene_number}.jpg",
+            folder / f"{scene_number}.jpeg",
+            folder / f"{scene_number}.png",
         ]
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-    # Otherwise use automatic scene numbering
-    number = index + 1
-
-    for ext in extensions:
-
-        candidate = image_dir / f"{number:03d}{ext}"
-
-        if candidate.exists():
-            return candidate
-
-        candidate = image_dir / f"{number}{ext}"
-
-        if candidate.exists():
-            return candidate
-
-    raise FileNotFoundError(
-        f"No image found for scene {number}.\n"
-        f"Expected something like:\n"
-        f"images/{number:03d}.jpg"
     )
-
-
-def prepare_image(image_path):
-    img = Image.open(image_path).convert("RGB")
-
-    src_ratio = img.width / img.height
-    dst_ratio = CANVAS_W / CANVAS_H
-
-    if src_ratio > dst_ratio:
-
-        new_h = CANVAS_H
-        new_w = int(CANVAS_H * src_ratio)
-
-    else:
-
-        new_w = CANVAS_W
-        new_h = int(CANVAS_W / src_ratio)
-
-    img = img.resize(
-        (new_w, new_h),
-        Image.LANCZOS
-    )
-
-    left = (new_w - CANVAS_W) // 2
-    top = (new_h - CANVAS_H) // 2
-
-    return img.crop(
-        (
-            left,
-            top,
-            left + CANVAS_W,
-            top + CANVAS_H
-        )
-    )
-
-
-def load_font(size=54):
-
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
 
     for path in candidates:
+        if path.exists():
+            return path
 
+    raise FileNotFoundError(
+        f"Image not found for scene {scene_number}. "
+        f"Expected something like {folder}/{scene_number:03d}.jpg"
+    )
+
+
+def prepare_image(source, output):
+    image = Image.open(source).convert("RGB")
+
+    source_ratio = image.width / image.height
+    target_ratio = WIDTH / HEIGHT
+
+    if source_ratio > target_ratio:
+        new_width = int(image.height * target_ratio)
+        left = (image.width - new_width) // 2
+        image = image.crop(
+            (left, 0, left + new_width, image.height)
+        )
+    else:
+        new_height = int(image.width / target_ratio)
+        top = (image.height - new_height) // 2
+        image = image.crop(
+            (0, top, image.width, top + new_height)
+        )
+
+    image = image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    image.save(output, quality=95)
+
+
+def get_font(size=54):
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+
+    for path in font_paths:
         if Path(path).exists():
             return ImageFont.truetype(path, size)
 
@@ -228,31 +176,19 @@ def load_font(size=54):
 
 
 def wrap_text(draw, text, font, max_width):
-
     words = text.split()
     lines = []
     current = ""
 
     for word in words:
-
         test = word if not current else current + " " + word
+        bbox = draw.textbbox((0, 0), test, font=font)
 
-        bbox = draw.textbbox(
-            (0, 0),
-            test,
-            font=font
-        )
-
-        width = bbox[2] - bbox[0]
-
-        if width <= max_width:
+        if bbox[2] <= max_width:
             current = test
-
         else:
-
             if current:
                 lines.append(current)
-
             current = word
 
     if current:
@@ -261,513 +197,260 @@ def wrap_text(draw, text, font, max_width):
     return lines
 
 
-def create_caption_frame(image, text, progress):
+def create_caption_image(text, output):
+    image = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
 
-    frame = image.copy()
+    font = get_font(54)
 
-    draw = ImageDraw.Draw(frame)
+    max_width = int(WIDTH * 0.82)
 
-    font = load_font(54)
-
-    max_width = 1500
-
-    lines = wrap_text(
-        draw,
-        text,
-        font,
-        max_width
-    )
-
-    # Keep captions to a reasonable number of lines
-    lines = lines[:3]
+    lines = wrap_text(draw, text, font, max_width)
 
     line_height = 68
-
     total_height = len(lines) * line_height
 
-    y = CANVAS_H - total_height - 80
+    y = HEIGHT - total_height - 90
 
     for line in lines:
-
-        bbox = draw.textbbox(
-            (0, 0),
-            line,
-            font=font
-        )
-
+        bbox = draw.textbbox((0, 0), line, font=font)
         text_width = bbox[2] - bbox[0]
 
-        x = (CANVAS_W - text_width) // 2
-
-        # Black outline
-        for ox in range(-3, 4):
-            for oy in range(-3, 4):
-
-                draw.text(
-                    (x + ox, y + oy),
-                    line,
-                    font=font,
-                    fill="black"
-                )
+        x = (WIDTH - text_width) // 2
 
         draw.text(
             (x, y),
             line,
             font=font,
-            fill="white"
+            fill="white",
+            stroke_width=4,
+            stroke_fill="black",
         )
 
         y += line_height
 
-    return frame
+    image.save(output)
 
 
-def render_scene(
-    image_path,
-    narration,
-    audio_path,
-    output_path,
-    duration
-):
+def render_scene(image, audio, caption, output, duration):
+    caption_image = caption
 
-    base = prepare_image(image_path)
-
-    total_frames = max(
-        int(duration * FPS),
-        FPS
+    filter_complex = (
+        f"[0:v]scale={WIDTH}:{HEIGHT},"
+        f"zoompan="
+        f"z='min(zoom+0.0007,1.12)':"
+        f"x='iw/2-(iw/zoom/2)':"
+        f"y='ih/2-(ih/zoom/2)':"
+        f"d={int(duration * FPS)}:"
+        f"s={WIDTH}x{HEIGHT}:"
+        f"fps={FPS}[base];"
+        f"[base][1:v]overlay=0:0:format=auto[v]"
     )
 
-    # Random but deterministic movement
-    direction = random.choice([
-        "zoom_in",
-        "zoom_out",
-        "pan_left",
-        "pan_right",
-    ])
-
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-
-        "-f",
-        "rawvideo",
-
-        "-pix_fmt",
-        "rgb24",
-
-        "-s",
-        f"{CANVAS_W}x{CANVAS_H}",
-
-        "-r",
-        str(FPS),
-
-        "-i",
-        "-",
-
-        "-i",
-        str(audio_path),
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "20",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "192k",
-
-        "-shortest",
-
-        str(output_path),
-
-        "-loglevel",
-        "error",
-    ]
-
-    process = subprocess.Popen(
-        ffmpeg_cmd,
-        stdin=subprocess.PIPE
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loop", "1",
+            "-i", str(image),
+            "-i", str(caption_image),
+            "-i", str(audio),
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "2:a",
+            "-t", str(duration),
+            "-r", str(FPS),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            str(output),
+        ]
     )
 
-    for i in range(total_frames):
 
-        progress = (
-            i / max(total_frames - 1, 1)
-        )
+def concat_clips(clips, output):
+    concat_file = output.parent / "concat.txt"
 
-        frame = base
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for clip in clips:
+            f.write(f"file '{clip.resolve()}'\n")
 
-        if direction == "zoom_in":
-
-            scale = 1.0 + 0.08 * progress
-
-        elif direction == "zoom_out":
-
-            scale = 1.08 - 0.08 * progress
-
-        else:
-
-            scale = 1.04
-
-        new_w = int(CANVAS_W * scale)
-        new_h = int(CANVAS_H * scale)
-
-        resized = frame.resize(
-            (new_w, new_h),
-            Image.LANCZOS
-        )
-
-        if direction == "pan_left":
-
-            max_x = new_w - CANVAS_W
-            x = int(max_x * progress)
-            y = (new_h - CANVAS_H) // 2
-
-        elif direction == "pan_right":
-
-            max_x = new_w - CANVAS_W
-            x = int(max_x * (1 - progress))
-            y = (new_h - CANVAS_H) // 2
-
-        else:
-
-            x = (new_w - CANVAS_W) // 2
-            y = (new_h - CANVAS_H) // 2
-
-        frame = resized.crop(
-            (
-                x,
-                y,
-                x + CANVAS_W,
-                y + CANVAS_H
-            )
-        )
-
-        frame = create_caption_frame(
-            frame,
-            narration,
-            progress
-        )
-
-        process.stdin.write(
-            frame.convert("RGB").tobytes()
-        )
-
-    process.stdin.close()
-
-    process.wait()
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"FFmpeg failed rendering {output_path}"
-        )
-
-
-def concat_clips(clip_paths, output_path, workdir):
-
-    list_file = workdir / "concat.txt"
-
-    with open(list_file, "w", encoding="utf-8") as f:
-
-        for clip in clip_paths:
-
-            safe_path = str(
-                clip.resolve()
-            ).replace("'", "'\\''")
-
-            f.write(
-                f"file '{safe_path}'\n"
-            )
-
-    run([
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_file),
-        "-c",
-        "copy",
-        str(output_path),
-        "-loglevel",
-        "error",
-    ])
-
-
-def add_background_music(
-    video_path,
-    music_path,
-    output_path
-):
-
-    run([
-        "ffmpeg",
-        "-y",
-
-        "-i",
-        str(video_path),
-
-        "-stream_loop",
-        "-1",
-
-        "-i",
-        str(music_path),
-
-        "-filter_complex",
-        "[1:a]volume=0.12[music];"
-        "[0:a][music]amix="
-        "inputs=2:"
-        "duration=first:"
-        "dropout_transition=2[aout]",
-
-        "-map",
-        "0:v",
-
-        "-map",
-        "[aout]",
-
-        "-c:v",
-        "copy",
-
-        "-c:a",
-        "aac",
-
-        "-shortest",
-
-        str(output_path),
-
-        "-loglevel",
-        "error",
-    ])
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file),
+            "-c", "copy",
+            str(output),
+        ]
+    )
 
 
 def main():
-
-    parser = argparse.ArgumentParser(
-        description="Animal Universe Flow Image Video Generator"
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--script",
-        required=True
+        required=True,
+        help="Path to script file",
     )
 
     parser.add_argument(
         "--out",
-        default="output/final_video.mp4"
-    )
-
-    parser.add_argument(
-        "--voice",
-        default=None
-    )
-
-    parser.add_argument(
-        "--music",
-        default=None
+        default="output/final_video.mp4",
     )
 
     parser.add_argument(
         "--images",
-        default="images"
+        default="images",
+    )
+
+    parser.add_argument(
+        "--voice",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--music",
+        default=None,
     )
 
     args = parser.parse_args()
 
-    settings, scenes = parse_script(
-        args.script
-    )
+    script_path = Path(args.script)
+    output = Path(args.out)
+    image_folder = Path(args.images)
 
-    voice = (
-        args.voice
-        or settings["voice"]
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    music = (
-        args.music
-        or settings["music"]
-    )
+    temp = output.parent / "temp"
+    temp.mkdir(parents=True, exist_ok=True)
 
-    image_dir = Path(args.images)
+    print("=" * 60)
+    print("FLOW IMAGE VIDEO GENERATOR")
+    print("=" * 60)
+    print("Pollinations: DISABLED")
+    print("Google Flow images: ENABLED")
+    print("=" * 60)
 
-    if not image_dir.exists():
+    voice, script_music, scenes = parse_script(script_path)
 
-        raise FileNotFoundError(
-            f"Image directory not found: {image_dir}"
-        )
+    if args.voice:
+        voice = args.voice
 
-    out_path = Path(args.out)
+    music = args.music or script_music
 
-    out_path.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    print(f"Voice: {voice}")
+    print(f"Scenes: {len(scenes)}")
+    print(f"Images folder: {image_folder}")
 
-    workdir = (
-        out_path.parent / "_work"
-    )
+    clips = []
 
-    if workdir.exists():
-        shutil.rmtree(workdir)
-
-    workdir.mkdir(
-        parents=True
-    )
-
-    print(
-        f"Loaded {len(scenes)} scenes."
-    )
-
-    print(
-        f"Voice: {voice}"
-    )
-
-    print(
-        f"Image folder: {image_dir}"
-    )
-
-    clip_paths = []
-
-    for i, scene in enumerate(scenes):
-
-        scene_number = i + 1
-
-        print(
-            f"\n[{scene_number}/{len(scenes)}] "
-            f"{scene['narration'][:80]}..."
-        )
-
-        audio_path = (
-            workdir /
-            f"scene_{scene_number:03d}.mp3"
-        )
-
-        clip_path = (
-            workdir /
-            f"scene_{scene_number:03d}.mp4"
-        )
+    for index, scene in enumerate(scenes, start=1):
+        print()
+        print(f"========== SCENE {index} ==========")
 
         image_path = find_image(
             scene["image"],
-            i,
-            image_dir
+            image_folder,
+            index,
         )
 
-        print(
-            f" -> using Flow image: "
-            f"{image_path}"
-        )
+        print(f"Image: {image_path}")
+        print(f"Narration: {scene['narration'][:100]}...")
 
-        print(
-            " -> generating narration "
-            "(edge-tts)"
-        )
+        audio_path = temp / f"scene_{index:03d}.mp3"
+        prepared_image = temp / f"image_{index:03d}.jpg"
+        caption_path = temp / f"caption_{index:03d}.png"
+        clip_path = temp / f"clip_{index:03d}.mp4"
+
+        print("Generating Edge-TTS narration...")
 
         synthesize_narration(
             scene["narration"],
             voice,
-            audio_path
+            audio_path,
         )
 
-        duration = (
-            get_duration(audio_path)
-            + 0.3
+        duration = get_duration(audio_path)
+
+        print(f"Duration: {duration:.2f} seconds")
+
+        print("Preparing image...")
+
+        prepare_image(
+            image_path,
+            prepared_image,
         )
 
-        print(
-            f" -> rendering scene "
-            f"({duration:.1f}s)"
+        print("Creating captions...")
+
+        create_caption_image(
+            scene["narration"],
+            caption_path,
         )
+
+        print("Rendering scene...")
 
         render_scene(
-            image_path,
-            scene["narration"],
+            prepared_image,
             audio_path,
+            caption_path,
             clip_path,
-            duration
+            duration,
         )
 
-        clip_paths.append(
-            clip_path
-        )
+        clips.append(clip_path)
 
-    print(
-        "\nConcatenating scenes..."
-    )
+        print(f"Scene {index} complete.")
 
-    combined = (
-        workdir /
-        "combined.mp4"
-    )
+    print()
+    print("========== JOINING SCENES ==========")
 
     concat_clips(
-        clip_paths,
-        combined,
-        workdir
+        clips,
+        output,
     )
 
-    if music and Path(music).exists():
+    if music:
+        music_path = Path(music)
 
-        print(
-            "Adding background music..."
-        )
+        if music_path.exists():
+            music_output = output.parent / "final_with_music.mp4"
 
-        add_background_music(
-            combined,
-            Path(music),
-            out_path
-        )
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i", str(output),
+                    "-stream_loop", "-1",
+                    "-i", str(music_path),
+                    "-filter_complex",
+                    "[1:a]volume=0.08[music];"
+                    "[0:a][music]amix=inputs=2:duration=first[a]",
+                    "-map", "0:v",
+                    "-map", "[a]",
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-shortest",
+                    str(music_output),
+                ]
+            )
 
-    else:
+            music_output.replace(output)
 
-        shutil.copy(
-            combined,
-            out_path
-        )
-
-    total_duration = get_duration(
-        out_path
-    )
-
-    print(
-        f"\nDONE!"
-    )
-
-    print(
-        f"Video: {out_path}"
-    )
-
-    print(
-        f"Duration: {total_duration:.1f}s"
-    )
-
-    print(
-        f"Scenes: {len(scenes)}"
-    )
+    print()
+    print("=" * 60)
+    print("VIDEO COMPLETE")
+    print("=" * 60)
+    print(f"Output: {output}")
 
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except Exception as e:
-
-        print(
-            f"\nERROR: {e}",
-            file=sys.stderr
-        )
-
-        sys.exit(1)
+    main()
