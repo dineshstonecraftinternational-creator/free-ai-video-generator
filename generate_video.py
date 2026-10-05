@@ -1,438 +1,773 @@
 #!/usr/bin/env python3
-"""
-Free AI Animated Video Generator
-----------------------------------
-Turns a plain-text script into a video of YOUR character actually talking:
-real word-accurate lip-sync (Rhubarb Lip Sync), blinking, a subtle idle bob,
-gesture animation, and AI-generated anime-style scene backgrounds -- all free,
-no API keys, fully automatable.
-
-Usage:
-    python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
-"""
 
 import argparse
 import asyncio
-import json
-import math
 import random
+import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
-from urllib.parse import quote
 
-import requests
 import edge_tts
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
-DEFAULT_VOICE = "en-US-AriaNeural"
-CANVAS_W, CANVAS_H = 1920, 1080
+
+DEFAULT_VOICE = "en-US-GuyNeural"
+CANVAS_W = 1920
+CANVAS_H = 1080
 FPS = 25
-POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
-ANIME_STYLE_SUFFIX = (", anime background art, cel shaded, Studio Ghibli inspired, hand-painted anime "
-                      "illustration, vibrant anime color palette, no photorealism")
-CHARACTER_DIR = Path(__file__).parent / "assets" / "character"
-
-# Rhubarb mouth-shape letters -> our 3 puppet mouth states
-VISEME_MAP = {
-    "A": "closed", "B": "closed", "G": "closed", "X": "closed",
-    "C": "mid", "E": "mid", "F": "mid", "H": "mid",
-    "D": "wide",
-}
 
 
-def parse_script(path: str):
+def run(cmd, **kwargs):
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        **kwargs
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(str(x) for x in cmd)}\n"
+            f"{result.stderr[-4000:]}"
+        )
+
+    return result
+
+
+def get_duration(path):
+    result = run([
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+
+    return float(result.stdout.strip())
+
+
+def parse_script(path):
     raw = Path(path).read_text(encoding="utf-8")
+
     blocks = raw.split("---")
 
-    settings = {"voice": DEFAULT_VOICE, "music": None}
+    settings = {
+        "voice": DEFAULT_VOICE,
+        "music": None,
+    }
+
     header = blocks[0].strip()
+
     for line in header.splitlines():
         line = line.strip()
+
         if not line:
             continue
+
         if line.upper().startswith("VOICE:"):
             settings["voice"] = line.split(":", 1)[1].strip()
+
         elif line.upper().startswith("MUSIC:"):
-            val = line.split(":", 1)[1].strip()
-            settings["music"] = val or None
+            value = line.split(":", 1)[1].strip()
+            settings["music"] = value or None
 
     scenes = []
-    for block in blocks[1:]:
+
+    for index, block in enumerate(blocks[1:], start=1):
         block = block.strip()
+
         if not block:
             continue
-        lines = [l for l in block.splitlines() if l.strip()]
-        image_prompt = None
+
+        lines = [
+            line.strip()
+            for line in block.splitlines()
+            if line.strip()
+        ]
+
+        image_name = None
         narration_lines = []
+
         for line in lines:
-            if line.upper().startswith("IMAGE:") and image_prompt is None:
-                image_prompt = line.split(":", 1)[1].strip()
+
+            if line.upper().startswith("IMAGE:") and image_name is None:
+                image_name = line.split(":", 1)[1].strip()
+
             else:
-                narration_lines.append(line.strip())
+                narration_lines.append(line)
+
         narration = " ".join(narration_lines).strip()
+
         if not narration:
             continue
-        if not image_prompt:
-            image_prompt = narration[:200]
-        scenes.append({"image_prompt": image_prompt, "narration": narration})
+
+        scenes.append({
+            "image": image_name,
+            "narration": narration,
+        })
 
     if not scenes:
-        raise ValueError("No scenes found. Separate scenes with '---' lines.")
+        raise ValueError(
+            "No scenes found. Separate scenes with --- lines."
+        )
+
     return settings, scenes
 
 
-async def _synthesize(text: str, voice: str, out_mp3: Path):
+async def synthesize_async(text, voice, output):
     communicate = edge_tts.Communicate(text, voice)
-    with open(out_mp3, "wb") as f:
+
+    with open(output, "wb") as f:
         async for chunk in communicate.stream():
+
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
 
 
-def synthesize_narration(text: str, voice: str, out_mp3: Path):
-    asyncio.run(_synthesize(text, voice, out_mp3))
+def synthesize_narration(text, voice, output):
+    asyncio.run(
+        synthesize_async(text, voice, output)
+    )
 
 
-def fetch_image(prompt: str, out_path: Path, width=CANVAS_W, height=CANVAS_H, retries=4):
-    seed = random.randint(1, 999_999)
-    styled_prompt = f"{prompt}{ANIME_STYLE_SUFFIX}"
-    url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
-           f"&seed={seed}&nologo=true&model=flux-anime")
-    fallback_url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
-                     f"&seed={seed}&nologo=true")
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            try_url = url if attempt <= retries - 1 else fallback_url
-            resp = requests.get(try_url, timeout=120)
-            resp.raise_for_status()
-            out_path.write_bytes(resp.content)
-            if out_path.stat().st_size > 5000:
-                return
-            last_err = "image response too small"
-        except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-        print(f"  [image] attempt {attempt} failed ({last_err}), retrying...")
-        time.sleep(3 * attempt)
-    raise RuntimeError(f"Failed to fetch image for prompt {prompt!r}: {last_err}")
+def find_image(image_name, index, image_dir):
+    extensions = [
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+    ]
+
+    # If IMAGE: explicitly specifies a filename
+    if image_name:
+        possible = Path(image_name)
+
+        candidates = [
+            image_dir / possible.name,
+            Path(image_name),
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+    # Otherwise use automatic scene numbering
+    number = index + 1
+
+    for ext in extensions:
+
+        candidate = image_dir / f"{number:03d}{ext}"
+
+        if candidate.exists():
+            return candidate
+
+        candidate = image_dir / f"{number}{ext}"
+
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"No image found for scene {number}.\n"
+        f"Expected something like:\n"
+        f"images/{number:03d}.jpg"
+    )
 
 
-def run(cmd, **kwargs):
-    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(str(c) for c in cmd)}\n{result.stderr[-3000:]}")
-    return result
-
-
-def get_duration(path: Path) -> float:
-    result = run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-    ])
-    return float(result.stdout.strip())
-
-
-def mp3_to_wav(mp3_path: Path, wav_path: Path):
-    run(["ffmpeg", "-y", "-i", str(mp3_path), "-ar", "22050", "-ac", "1", str(wav_path), "-loglevel", "error"])
-
-
-def run_rhubarb(wav_path: Path, out_json: Path, rhubarb_bin="rhubarb"):
-    """Runs Rhubarb Lip Sync and returns a list of {start, end, value} mouth cues."""
-    try:
-        run([
-            rhubarb_bin, "-f", "json", "-o", str(out_json),
-            "--recognizer", "phonetic",
-            str(wav_path),
-        ])
-        data = json.loads(out_json.read_text(encoding="utf-8"))
-        return data.get("mouthCues", [])
-    except Exception as e:  # noqa: BLE001
-        print(f"  [lipsync] Rhubarb unavailable/failed ({e}); falling back to a simple approximation.")
-        return None
-
-
-def approximate_mouth_cues(wav_path: Path, duration: float):
-    """Fallback if Rhubarb isn't installed: derive rough mouth movement from audio volume."""
-    import wave
-    import audioop
-
-    cues = []
-    try:
-        with wave.open(str(wav_path), "rb") as wf:
-            framerate = wf.getframerate()
-            chunk_ms = 90
-            chunk_frames = int(framerate * chunk_ms / 1000)
-            t = 0.0
-            while True:
-                frames = wf.readframes(chunk_frames)
-                if not frames:
-                    break
-                rms = audioop.rms(frames, wf.getsampwidth())
-                if rms < 200:
-                    letter = "X"
-                elif rms < 800:
-                    letter = "B"
-                elif rms < 2000:
-                    letter = "C"
-                else:
-                    letter = "D"
-                cues.append({"start": t, "end": t + chunk_ms / 1000, "value": letter})
-                t += chunk_ms / 1000
-    except Exception as e:  # noqa: BLE001
-        print(f"  [lipsync] fallback also failed ({e}); using static mid-mouth for whole clip.")
-        cues = [{"start": 0, "end": duration, "value": "C"}]
-    return cues
-
-
-def mouth_state_at(cues, t: float) -> str:
-    for cue in cues:
-        if cue["start"] <= t < cue["end"]:
-            return VISEME_MAP.get(cue["value"], "closed")
-    return "closed"
-
-
-class CharacterRig:
-    def __init__(self, character_dir: Path):
-        cfg = json.loads((character_dir / "rig.json").read_text())
-        self.left_eye_pos = tuple(cfg["left_eye_pos"])
-        self.right_eye_pos = tuple(cfg["right_eye_pos"])
-        self.mouth_pos = tuple(cfg["mouth_pos"])
-        self.canvas_size = tuple(cfg["canvas_size"])
-        self.right_arm_idle_pos = tuple(cfg["right_arm_idle_pos"])
-        self.right_arm_raised_pos = tuple(cfg["right_arm_raised_pos"])
-
-        base = Image.open(character_dir / "base.png").convert("RGBA")
-        eye_l_open = Image.open(character_dir / "eye_l_open.png")
-        eye_r_open = Image.open(character_dir / "eye_r_open.png")
-        eye_closed = Image.open(character_dir / "eye_closed.png")
-        mouths = {
-            "closed": Image.open(character_dir / "mouth_closed.png"),
-            "mid": Image.open(character_dir / "mouth_mid.png"),
-            "wide": Image.open(character_dir / "mouth_wide.png"),
-        }
-        arms = {
-            "idle": (Image.open(character_dir / "arm_idle.png").convert("RGBA"), self.right_arm_idle_pos),
-            "raised": (Image.open(character_dir / "arm_raised.png").convert("RGBA"), self.right_arm_raised_pos),
-        }
-
-        self.frames = {}
-        for eyes_state in ("open", "closed"):
-            for mouth_state, mouth_img in mouths.items():
-                for arm_state, (arm_img, arm_pos) in arms.items():
-                    frame = base.copy()
-                    frame.paste(arm_img, arm_pos, arm_img)
-                    if eyes_state == "open":
-                        frame.paste(eye_l_open, self.left_eye_pos, eye_l_open)
-                        frame.paste(eye_r_open, self.right_eye_pos, eye_r_open)
-                    else:
-                        frame.paste(eye_closed, self.left_eye_pos, eye_closed)
-                        frame.paste(eye_closed, self.right_eye_pos, eye_closed)
-                    frame.paste(mouth_img, self.mouth_pos, mouth_img)
-                    self.frames[(eyes_state, mouth_state, arm_state)] = frame
-
-    def get(self, eyes_state: str, mouth_state: str, arm_state: str) -> Image.Image:
-        return self.frames[(eyes_state, mouth_state, arm_state)]
-
-
-def make_blink_schedule(duration: float, min_gap=2.5, max_gap=5.5, blink_len=0.14):
-    schedule = []
-    t = random.uniform(1.0, min_gap)
-    while t < duration:
-        schedule.append((t, t + blink_len))
-        t += random.uniform(min_gap, max_gap)
-    return schedule
-
-
-def is_blinking(schedule, t: float) -> bool:
-    for start, end in schedule:
-        if start <= t < end:
-            return True
-    return False
-
-
-def make_gesture_schedule(duration: float, min_gap=3.5, max_gap=7.0, gesture_len=1.3):
-    """Periodically raises the character's arm for a natural talking-gesture feel."""
-    schedule = []
-    t = random.uniform(1.5, min_gap)
-    while t < duration - gesture_len * 0.5:
-        schedule.append((t, t + gesture_len))
-        t += random.uniform(min_gap, max_gap)
-    return schedule
-
-
-def arm_state_at(schedule, t: float) -> str:
-    for start, end in schedule:
-        if start <= t < end:
-            return "raised"
-    return "idle"
-
-
-def prepare_background(image_path: Path, width, height) -> Image.Image:
+def prepare_image(image_path):
     img = Image.open(image_path).convert("RGB")
+
     src_ratio = img.width / img.height
-    dst_ratio = width / height
+    dst_ratio = CANVAS_W / CANVAS_H
+
     if src_ratio > dst_ratio:
-        new_h = height
-        new_w = int(height * src_ratio)
+
+        new_h = CANVAS_H
+        new_w = int(CANVAS_H * src_ratio)
+
     else:
-        new_w = width
-        new_h = int(width / src_ratio)
-    img = img.resize((new_w, new_h))
-    left = (new_w - width) // 2
-    top = (new_h - height) // 2
-    return img.crop((left, top, left + width, top + height))
+
+        new_w = CANVAS_W
+        new_h = int(CANVAS_W / src_ratio)
+
+    img = img.resize(
+        (new_w, new_h),
+        Image.LANCZOS
+    )
+
+    left = (new_w - CANVAS_W) // 2
+    top = (new_h - CANVAS_H) // 2
+
+    return img.crop(
+        (
+            left,
+            top,
+            left + CANVAS_W,
+            top + CANVAS_H
+        )
+    )
 
 
-def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_schedule,
-                  gesture_schedule, duration: float, audio_path: Path, out_path: Path,
-                  char_scale=0.85, fps=FPS):
-    char_h = int(CANVAS_H * char_scale)
-    char_w = int(char_h * rig.canvas_size[0] / rig.canvas_size[1])
-    anchor_x = (CANVAS_W - char_w) // 2
-    anchor_y = CANVAS_H - char_h + 20
+def load_font(size=54):
 
-    resized_cache = {
-        key: img.resize((char_w, char_h), Image.LANCZOS)
-        for key, img in rig.frames.items()
-    }
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
 
-    total_frames = max(int(duration * fps), fps)
+    for path in candidates:
+
+        if Path(path).exists():
+            return ImageFont.truetype(path, size)
+
+    return ImageFont.load_default()
+
+
+def wrap_text(draw, text, font, max_width):
+
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+
+        test = word if not current else current + " " + word
+
+        bbox = draw.textbbox(
+            (0, 0),
+            test,
+            font=font
+        )
+
+        width = bbox[2] - bbox[0]
+
+        if width <= max_width:
+            current = test
+
+        else:
+
+            if current:
+                lines.append(current)
+
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def create_caption_frame(image, text, progress):
+
+    frame = image.copy()
+
+    draw = ImageDraw.Draw(frame)
+
+    font = load_font(54)
+
+    max_width = 1500
+
+    lines = wrap_text(
+        draw,
+        text,
+        font,
+        max_width
+    )
+
+    # Keep captions to a reasonable number of lines
+    lines = lines[:3]
+
+    line_height = 68
+
+    total_height = len(lines) * line_height
+
+    y = CANVAS_H - total_height - 80
+
+    for line in lines:
+
+        bbox = draw.textbbox(
+            (0, 0),
+            line,
+            font=font
+        )
+
+        text_width = bbox[2] - bbox[0]
+
+        x = (CANVAS_W - text_width) // 2
+
+        # Black outline
+        for ox in range(-3, 4):
+            for oy in range(-3, 4):
+
+                draw.text(
+                    (x + ox, y + oy),
+                    line,
+                    font=font,
+                    fill="black"
+                )
+
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill="white"
+        )
+
+        y += line_height
+
+    return frame
+
+
+def render_scene(
+    image_path,
+    narration,
+    audio_path,
+    output_path,
+    duration
+):
+
+    base = prepare_image(image_path)
+
+    total_frames = max(
+        int(duration * FPS),
+        FPS
+    )
+
+    # Random but deterministic movement
+    direction = random.choice([
+        "zoom_in",
+        "zoom_out",
+        "pan_left",
+        "pan_right",
+    ])
 
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CANVAS_W}x{CANVAS_H}", "-r", str(fps),
-        "-i", "-",
-        "-i", str(audio_path),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-shortest",
-        str(out_path), "-loglevel", "error",
-    ]
-    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        "ffmpeg",
+        "-y",
 
-    bg_rgba = background.convert("RGBA")
+        "-f",
+        "rawvideo",
+
+        "-pix_fmt",
+        "rgb24",
+
+        "-s",
+        f"{CANVAS_W}x{CANVAS_H}",
+
+        "-r",
+        str(FPS),
+
+        "-i",
+        "-",
+
+        "-i",
+        str(audio_path),
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "20",
+
+        "-pix_fmt",
+        "yuv420p",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "192k",
+
+        "-shortest",
+
+        str(output_path),
+
+        "-loglevel",
+        "error",
+    ]
+
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE
+    )
 
     for i in range(total_frames):
-        t = i / fps
-        mouth_state = mouth_state_at(mouth_cues, t) if mouth_cues else "closed"
-        eyes_state = "closed" if is_blinking(blink_schedule, t) else "open"
-        arm_state = arm_state_at(gesture_schedule, t)
-        char_img = resized_cache[(eyes_state, mouth_state, arm_state)]
 
-        bob = int(5 * math.sin(2 * math.pi * t / 2.6))
-        frame = bg_rgba.copy()
-        frame.alpha_composite(char_img, (anchor_x, anchor_y + bob))
+        progress = (
+            i / max(total_frames - 1, 1)
+        )
 
-        proc.stdin.write(frame.convert("RGB").tobytes())
+        frame = base
 
-    proc.stdin.close()
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg frame encoding failed for {out_path}")
+        if direction == "zoom_in":
+
+            scale = 1.0 + 0.08 * progress
+
+        elif direction == "zoom_out":
+
+            scale = 1.08 - 0.08 * progress
+
+        else:
+
+            scale = 1.04
+
+        new_w = int(CANVAS_W * scale)
+        new_h = int(CANVAS_H * scale)
+
+        resized = frame.resize(
+            (new_w, new_h),
+            Image.LANCZOS
+        )
+
+        if direction == "pan_left":
+
+            max_x = new_w - CANVAS_W
+            x = int(max_x * progress)
+            y = (new_h - CANVAS_H) // 2
+
+        elif direction == "pan_right":
+
+            max_x = new_w - CANVAS_W
+            x = int(max_x * (1 - progress))
+            y = (new_h - CANVAS_H) // 2
+
+        else:
+
+            x = (new_w - CANVAS_W) // 2
+            y = (new_h - CANVAS_H) // 2
+
+        frame = resized.crop(
+            (
+                x,
+                y,
+                x + CANVAS_W,
+                y + CANVAS_H
+            )
+        )
+
+        frame = create_caption_frame(
+            frame,
+            narration,
+            progress
+        )
+
+        process.stdin.write(
+            frame.convert("RGB").tobytes()
+        )
+
+    process.stdin.close()
+
+    process.wait()
+
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg failed rendering {output_path}"
+        )
 
 
-def concat_clips(clip_paths, out_path: Path, workdir: Path):
-    list_file = workdir / "concat_list.txt"
-    list_file.write_text(
-        "\n".join(f"file '{p.resolve()}'" for p in clip_paths), encoding="utf-8"
-    )
+def concat_clips(clip_paths, output_path, workdir):
+
+    list_file = workdir / "concat.txt"
+
+    with open(list_file, "w", encoding="utf-8") as f:
+
+        for clip in clip_paths:
+
+            safe_path = str(
+                clip.resolve()
+            ).replace("'", "'\\''")
+
+            f.write(
+                f"file '{safe_path}'\n"
+            )
+
     run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_file), "-c", "copy", str(out_path), "-loglevel", "error",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-c",
+        "copy",
+        str(output_path),
+        "-loglevel",
+        "error",
     ])
 
 
-def add_background_music(video_path: Path, music_path: Path, out_path: Path, volume=0.12):
+def add_background_music(
+    video_path,
+    music_path,
+    output_path
+):
+
     run([
-        "ffmpeg", "-y",
-        "-i", str(video_path), "-stream_loop", "-1", "-i", str(music_path),
+        "ffmpeg",
+        "-y",
+
+        "-i",
+        str(video_path),
+
+        "-stream_loop",
+        "-1",
+
+        "-i",
+        str(music_path),
+
         "-filter_complex",
-        f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-shortest", str(out_path),
-        "-loglevel", "error",
+        "[1:a]volume=0.12[music];"
+        "[0:a][music]amix="
+        "inputs=2:"
+        "duration=first:"
+        "dropout_transition=2[aout]",
+
+        "-map",
+        "0:v",
+
+        "-map",
+        "[aout]",
+
+        "-c:v",
+        "copy",
+
+        "-c:a",
+        "aac",
+
+        "-shortest",
+
+        str(output_path),
+
+        "-loglevel",
+        "error",
     ])
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate an animated talking-character video from a script.")
-    ap.add_argument("--script", required=True)
-    ap.add_argument("--out", default="output/final_video.mp4")
-    ap.add_argument("--voice", default=None)
-    ap.add_argument("--music", default=None)
-    ap.add_argument("--character-scale", type=float, default=0.85)
-    ap.add_argument("--rhubarb-bin", default="rhubarb")
-    ap.add_argument("--keep-temp", action="store_true")
-    args = ap.parse_args()
 
-    settings, scenes = parse_script(args.script)
-    voice = args.voice or settings["voice"]
-    music = args.music or settings["music"]
+    parser = argparse.ArgumentParser(
+        description="Animal Universe Flow Image Video Generator"
+    )
+
+    parser.add_argument(
+        "--script",
+        required=True
+    )
+
+    parser.add_argument(
+        "--out",
+        default="output/final_video.mp4"
+    )
+
+    parser.add_argument(
+        "--voice",
+        default=None
+    )
+
+    parser.add_argument(
+        "--music",
+        default=None
+    )
+
+    parser.add_argument(
+        "--images",
+        default="images"
+    )
+
+    args = parser.parse_args()
+
+    settings, scenes = parse_script(
+        args.script
+    )
+
+    voice = (
+        args.voice
+        or settings["voice"]
+    )
+
+    music = (
+        args.music
+        or settings["music"]
+    )
+
+    image_dir = Path(args.images)
+
+    if not image_dir.exists():
+
+        raise FileNotFoundError(
+            f"Image directory not found: {image_dir}"
+        )
 
     out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    workdir = out_path.parent / "_work"
+
+    out_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    workdir = (
+        out_path.parent / "_work"
+    )
+
     if workdir.exists():
         shutil.rmtree(workdir)
-    workdir.mkdir(parents=True)
 
-    print(f"Loaded {len(scenes)} scene(s). Voice: {voice}. Music: {music or 'none'}")
-    rig = CharacterRig(CHARACTER_DIR)
+    workdir.mkdir(
+        parents=True
+    )
+
+    print(
+        f"Loaded {len(scenes)} scenes."
+    )
+
+    print(
+        f"Voice: {voice}"
+    )
+
+    print(
+        f"Image folder: {image_dir}"
+    )
 
     clip_paths = []
+
     for i, scene in enumerate(scenes):
-        print(f"\n[{i+1}/{len(scenes)}] {scene['narration'][:70]}...")
-        audio_mp3 = workdir / f"scene_{i:03}.mp3"
-        audio_wav = workdir / f"scene_{i:03}.wav"
-        image_path = workdir / f"scene_{i:03}.jpg"
-        rhubarb_json = workdir / f"scene_{i:03}_mouth.json"
-        clip_path = workdir / f"scene_{i:03}.mp4"
 
-        print("  -> generating narration (edge-tts)")
-        synthesize_narration(scene["narration"], voice, audio_mp3)
-        duration = get_duration(audio_mp3) + 0.3
-        mp3_to_wav(audio_mp3, audio_wav)
+        scene_number = i + 1
 
-        print("  -> computing lip-sync (Rhubarb)")
-        mouth_cues = run_rhubarb(audio_wav, rhubarb_json, args.rhubarb_bin)
-        if mouth_cues is None:
-            mouth_cues = approximate_mouth_cues(audio_wav, duration)
-        blink_schedule = make_blink_schedule(duration)
-        gesture_schedule = make_gesture_schedule(duration)
+        print(
+            f"\n[{scene_number}/{len(scenes)}] "
+            f"{scene['narration'][:80]}..."
+        )
 
-        print(f"  -> generating background: {scene['image_prompt'][:70]}...")
-        fetch_image(scene["image_prompt"], image_path, CANVAS_W, CANVAS_H)
-        background = prepare_background(image_path, CANVAS_W, CANVAS_H)
+        audio_path = (
+            workdir /
+            f"scene_{scene_number:03d}.mp3"
+        )
 
-        print(f"  -> rendering animated scene ({duration:.1f}s, {int(duration*FPS)} frames)")
-        render_scene(background, rig, mouth_cues, blink_schedule, gesture_schedule, duration,
-                     audio_mp3, clip_path, char_scale=args.character_scale)
-        clip_paths.append(clip_path)
+        clip_path = (
+            workdir /
+            f"scene_{scene_number:03d}.mp4"
+        )
 
-    print("\nConcatenating all scenes...")
-    no_music_path = workdir / "combined_no_music.mp4"
-    concat_clips(clip_paths, no_music_path, workdir)
+        image_path = find_image(
+            scene["image"],
+            i,
+            image_dir
+        )
+
+        print(
+            f" -> using Flow image: "
+            f"{image_path}"
+        )
+
+        print(
+            " -> generating narration "
+            "(edge-tts)"
+        )
+
+        synthesize_narration(
+            scene["narration"],
+            voice,
+            audio_path
+        )
+
+        duration = (
+            get_duration(audio_path)
+            + 0.3
+        )
+
+        print(
+            f" -> rendering scene "
+            f"({duration:.1f}s)"
+        )
+
+        render_scene(
+            image_path,
+            scene["narration"],
+            audio_path,
+            clip_path,
+            duration
+        )
+
+        clip_paths.append(
+            clip_path
+        )
+
+    print(
+        "\nConcatenating scenes..."
+    )
+
+    combined = (
+        workdir /
+        "combined.mp4"
+    )
+
+    concat_clips(
+        clip_paths,
+        combined,
+        workdir
+    )
 
     if music and Path(music).exists():
-        print("Mixing background music...")
-        add_background_music(no_music_path, Path(music), out_path)
+
+        print(
+            "Adding background music..."
+        )
+
+        add_background_music(
+            combined,
+            Path(music),
+            out_path
+        )
+
     else:
-        if music:
-            print(f"  (music file '{music}' not found, skipping)")
-        shutil.copy(no_music_path, out_path)
 
-    if not args.keep_temp:
-        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.copy(
+            combined,
+            out_path
+        )
 
-    total_duration = get_duration(out_path)
-    print(f"\nDone! Video saved to: {out_path} ({total_duration:.1f}s)")
+    total_duration = get_duration(
+        out_path
+    )
+
+    print(
+        f"\nDONE!"
+    )
+
+    print(
+        f"Video: {out_path}"
+    )
+
+    print(
+        f"Duration: {total_duration:.1f}s"
+    )
+
+    print(
+        f"Scenes: {len(scenes)}"
+    )
 
 
 if __name__ == "__main__":
+
     try:
+
         main()
-    except Exception as e:  # noqa: BLE001
-        print(f"\nERROR: {e}", file=sys.stderr)
+
+    except Exception as e:
+
+        print(
+            f"\nERROR: {e}",
+            file=sys.stderr
+        )
+
         sys.exit(1)
